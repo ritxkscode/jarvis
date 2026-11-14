@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useStore } from '../lib/store'
 
 interface TranscriptEntry {
   id: string
@@ -78,14 +79,65 @@ export function useBridge() {
           addTranscript('jarvis', msg.text)
         }
         break
+      case 'tool_call':
+        // Execute UI control tool on the store
+        handleToolCall(msg)
+        break
       case 'tool_result':
-        // UI updates handled by store
+        // Confirmation received
         break
       case 'pong':
         // Heartbeat
         break
       case 'error':
         addTranscript('system', `Error: ${msg.message}`)
+        break
+    }
+  }, [])
+
+  const handleToolCall = useCallback((msg: BridgeMessage) => {
+    const { tool, args } = msg
+    const store = useStore.getState()
+
+    switch (tool) {
+      case 'ui_theme':
+        if (args.accentColor) store.setAccentColor(args.accentColor)
+        if (args.backgroundColor) store.setBackgroundColor(args.backgroundColor)
+        break
+      case 'ui_reactor':
+        if (args.color) store.setReactorColor(args.color)
+        if (args.intensity !== undefined) store.setReactorIntensity(args.intensity)
+        if (args.style) store.setReactorStyle(args.style)
+        if (args.scale !== undefined) store.setReactorScale(args.scale)
+        if (args.visible !== undefined) store.setReactorVisible(args.visible)
+        break
+      case 'ui_orbit':
+        if (args.action === 'add' && args.url) store.addOrbitImage(args.url)
+        else if (args.action === 'remove' && args.url) store.removeOrbitImage(args.url)
+        else if (args.action === 'clear') store.clearOrbitImages()
+        break
+      case 'ui_chrome':
+        if (args.transcript !== undefined) store.setShowTranscript(args.transcript)
+        if (args.sidePanels !== undefined) store.setShowSidePanels(args.sidePanels)
+        if (args.rails !== undefined) store.setShowRails(args.rails)
+        if (args.badges !== undefined) store.setShowBadges(args.badges)
+        break
+      case 'ui_effect':
+        // Trigger visual effects (pulse, flash, etc.)
+        if (args.type === 'pulse' && args.color) {
+          const originalColor = store.reactorColor
+          store.setReactorColor(args.color)
+          setTimeout(() => store.setReactorColor(originalColor), args.duration || 500)
+        }
+        break
+      case 'ui_screen':
+        if (args.action === 'clear') {
+          // Clear transcript
+          useStore.getState().clearOrbitImages()
+        }
+        break
+      case 'ui_reset':
+        store.reset()
         break
     }
   }, [])

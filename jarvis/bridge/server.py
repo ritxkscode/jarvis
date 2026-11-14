@@ -22,6 +22,114 @@ from ..config.secrets import get_secrets_manager
 from .ollama import OllamaClient, OllamaConfig, create_ollama_client
 
 
+# UI Control Tool Definitions for LLM
+UI_CONTROL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_theme",
+            "description": "Change the UI theme colors (accent and background)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "accentColor": {"type": "string", "description": "Hex color for accent (e.g., '#00d4ff', '#ff0000', '#00ff00')"},
+                    "backgroundColor": {"type": "string", "description": "Hex color for background (e.g., '#01060c', '#1a1a2e')"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_reactor",
+            "description": "Control the arc reactor appearance",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "color": {"type": "string", "description": "Hex color for reactor (e.g., '#00d4ff', '#ff0000')"},
+                    "intensity": {"type": "number", "minimum": 0, "maximum": 2, "description": "Glow intensity (0-2)"},
+                    "style": {"type": "string", "enum": ["ring", "sphere", "wire"], "description": "Reactor geometry style"},
+                    "scale": {"type": "number", "minimum": 0.1, "maximum": 3, "description": "Size scale factor"},
+                    "visible": {"type": "boolean", "description": "Show/hide reactor"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_orbit",
+            "description": "Manage orbit images around the reactor",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "remove", "clear"], "description": "Action to perform"},
+                    "url": {"type": "string", "description": "Image URL (for add/remove)"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_chrome",
+            "description": "Show/hide UI chrome elements",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transcript": {"type": "boolean", "description": "Show transcript panel"},
+                    "sidePanels": {"type": "boolean", "description": "Show side panels"},
+                    "rails": {"type": "boolean", "description": "Show side rails"},
+                    "badges": {"type": "boolean", "description": "Show status badges"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_effect",
+            "description": "Trigger visual effects on the reactor",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["pulse"], "description": "Effect type"},
+                    "color": {"type": "string", "description": "Hex color for effect"},
+                    "duration": {"type": "number", "description": "Duration in milliseconds"}
+                },
+                "required": ["type", "color"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_screen",
+            "description": "Control screen-level actions",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["clear"], "description": "Action to perform"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_reset",
+            "description": "Reset all UI to defaults",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+]
+
+
 @dataclass
 class BridgeConfig:
     """Bridge configuration from environment."""
@@ -205,6 +313,19 @@ class BridgeServer:
 
         # Static file serving for frontend (production)
         # In dev, frontend runs on separate Vite server
+        static_path = Path(__file__).parent / "static"
+        if static_path.exists():
+            # Serve index.html at root
+            async def serve_index(request):
+                return web.FileResponse(static_path / "index.html")
+            self.app.router.add_get("/", serve_index)
+            # Serve other static files
+            self.app.router.add_static("/assets", static_path / "assets")
+            # Serve favicon as a route
+            async def serve_favicon(request):
+                return web.FileResponse(static_path / "favicon.svg")
+            self.app.router.add_get("/favicon.svg", serve_favicon)
+            logger.info(f"[jarvis] Serving static files from {static_path}")
 
         # File/media proxy endpoints (SSRF guarded)
         self.app.router.add_get("/file", self._handle_file_proxy)
@@ -412,24 +533,60 @@ class BridgeServer:
             # Build conversation context from session
             # For now, simple single-turn
             messages = [
-                {"role": "system", "content": "You are JARVIS, a helpful AI assistant. Be concise and natural."},
+                {"role": "system", "content": "You are JARVIS, a helpful AI assistant. Be concise and natural. You have access to UI control tools - use them when the user asks to change the interface appearance, reactor style, orbit images, or theme."},
                 {"role": "user", "content": prompt},
             ]
 
-            result = await self.ollama_client.chat(messages)
+            result = await self.ollama_client.chat(messages, tools=UI_CONTROL_TOOLS)
 
             if "error" in result:
                 return f"Error: {result['error']}"
 
             # Extract response
             if "message" in result and "content" in result["message"]:
-                return result["message"]["content"]
+                content = result["message"]["content"]
+
+                # Handle tool calls from Ollama
+                if "tool_calls" in result["message"]:
+                    for tool_call in result["message"]["tool_calls"]:
+                        await self._execute_llm_tool_call(tool_call)
+                    # If content is empty but we have tool calls, provide a fallback message
+                    if not content or not content.strip():
+                        content = "Done! I've updated the UI for you."
+
+                return content
 
             return "No response from Ollama"
 
         except Exception as e:
             logger.error(f"[jarvis] Ollama error: {e}")
             return f"Error: {e}"
+
+    async def _execute_llm_tool_call(self, tool_call: dict):
+        """Execute a tool call from the LLM and broadcast to frontend."""
+        try:
+            function = tool_call.get("function", {})
+            tool_name = function.get("name")
+            # Ollama returns arguments as a dict, not a JSON string
+            tool_args = function.get("arguments", {})
+            if isinstance(tool_args, str):
+                tool_args = json.loads(tool_args)
+
+            if tool_name in ("ui_theme", "ui_reactor", "ui_orbit", "ui_chrome", "ui_effect", "ui_screen", "ui_reset"):
+                call_id = str(uuid.uuid4())
+                # Broadcast tool call for frontend to execute
+                await self._broadcast({
+                    "type": "tool_call",
+                    "id": call_id,
+                    "tool": tool_name,
+                    "args": tool_args
+                })
+                logger.debug(f"[jarvis] Executed LLM tool call: {tool_name} with args: {tool_args}")
+            else:
+                logger.warning(f"[jarvis] Unknown LLM tool: {tool_name}")
+
+        except Exception as e:
+            logger.error(f"[jarvis] Error executing LLM tool call: {e}")
 
     async def _process_with_claude(self, prompt: str, session: ClientSession) -> str:
         """Process prompt with Claude CLI."""
@@ -487,10 +644,17 @@ class BridgeServer:
         tool_args = msg.get("args", {})
         call_id = msg.get("id", str(uuid.uuid4()))
 
-        # UI control tools
+        # UI control tools - broadcast to all clients for execution
         if tool_name in ("ui_theme", "ui_reactor", "ui_orbit", "ui_chrome", "ui_effect", "ui_screen", "ui_reset"):
-            # Echo back to all clients for UI update
+            # Broadcast tool call for frontend to execute
             await self._broadcast({
+                "type": "tool_call",
+                "id": call_id,
+                "tool": tool_name,
+                "args": tool_args
+            })
+            # Also send confirmation back to caller
+            await session.ws.send_json({
                 "type": "tool_result",
                 "id": call_id,
                 "tool": tool_name,
