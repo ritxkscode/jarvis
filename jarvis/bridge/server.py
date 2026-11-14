@@ -19,6 +19,7 @@ from loguru import logger
 
 from ..config.settings import get_settings
 from ..config.secrets import get_secrets_manager
+from .ollama import OllamaClient, OllamaConfig, create_ollama_client
 
 
 @dataclass
@@ -40,6 +41,10 @@ class BridgeConfig:
     claude_executable: str = "claude"
     elevenlabs_api_key: Optional[str] = None
     elevenlabs_voice_id: Optional[str] = None
+    # Ollama settings
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "llama3.1"
+    use_ollama: bool = False
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -69,6 +74,10 @@ class BridgeConfig:
             claude_executable=os.environ.get("JARVIS_CLAUDE_EXECUTABLE", "claude"),
             elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY") or None,
             elevenlabs_voice_id=os.environ.get("JARVIS_VOICE_ID") or None,
+            # Ollama settings
+            ollama_host=os.environ.get("JARVIS_OLLAMA_HOST", "http://localhost:11434"),
+            ollama_model=os.environ.get("JARVIS_OLLAMA_MODEL", "llama3.1"),
+            use_ollama=get_bool("JARVIS_USE_OLLAMA"),
         )
 
 
@@ -83,7 +92,7 @@ class ClientSession:
 
 
 class BridgeServer:
-    """WebSocket bridge server connecting frontend to Claude."""
+    """WebSocket bridge server connecting frontend to AI (Claude or Ollama)."""
 
     def __init__(self, config: Optional[BridgeConfig] = None):
         self.config = config or BridgeConfig.from_env()
@@ -92,6 +101,7 @@ class BridgeServer:
         self.site: Optional[web.TCPSite] = None
         self.sessions: dict[str, ClientSession] = {}
         self.claude_process: Optional[subprocess.Popen] = None
+        self.ollama_client: Optional[OllamaClient] = None
         self._running = False
         self._setup_logging()
 
@@ -107,7 +117,26 @@ class BridgeServer:
     async def start(self) -> None:
         """Start the bridge server."""
         logger.info(f"[jarvis] Starting bridge on {self.config.host}:{self.config.port}")
-        logger.info(f"[jarvis] Model: {self.config.model} · Effort: {self.config.effort}")
+
+        # Initialize LLM backend
+        if self.config.use_ollama:
+            logger.info(f"[jarvis] LLM: Ollama ({self.config.ollama_model} @ {self.config.ollama_host})")
+            self.ollama_client = OllamaClient(OllamaConfig(
+                host=self.config.ollama_host,
+                model=self.config.ollama_model,
+            ))
+            if await self.ollama_client.is_available():
+                models = await self.ollama_client.list_models()
+                if self.config.ollama_model not in models:
+                    logger.info(f"[jarvis] Pulling model {self.config.ollama_model}...")
+                    await self.ollama_client.pull_model(self.config.ollama_model)
+                logger.info("[jarvis] Ollama ready")
+            else:
+                logger.warning("[jarvis] Ollama not available, falling back to Claude CLI")
+                self.config.use_ollama = False
+        else:
+            logger.info(f"[jarvis] LLM: Claude ({self.config.model} · Effort: {self.config.effort})")
+
         logger.info(f"[jarvis] Writes: {'enabled' if self.config.allow_writes else 'disabled (read-only)'}")
         logger.info(f"[jarvis] MCP servers: {self.config.mcp_servers or 'all configured'}")
         logger.info(f"[jarvis] Account connectors: {'enabled' if self.config.account_connectors else 'disabled'}")
@@ -154,6 +183,10 @@ class BridgeServer:
                 self.claude_process.kill()
                 await asyncio.to_thread(self.claude_process.wait)
 
+        # Close Ollama client
+        if self.ollama_client and self.ollama_client._session:
+            await self.ollama_client._session.close()
+
         # Stop web server
         if self.site:
             await self.site.stop()
@@ -194,12 +227,22 @@ class BridgeServer:
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """Health check endpoint - reports capabilities."""
+        if self.config.use_ollama:
+            return web.json_response({
+                "ok": True,
+                "tts": self.config.elevenlabs_api_key is not None,
+                "stt": self.config.elevenlabs_api_key is not None,
+                "model": f"ollama/{self.config.ollama_model}",
+                "provider": "ollama",
+                "writes": self.config.allow_writes,
+            })
         return web.json_response({
             "ok": True,
             "tts": self.config.elevenlabs_api_key is not None,
             "stt": self.config.elevenlabs_api_key is not None,
             "model": self.config.model,
             "effort": self.config.effort,
+            "provider": "claude",
             "writes": self.config.allow_writes,
         })
 
@@ -228,13 +271,14 @@ class BridgeServer:
 
         try:
             # Send welcome message
+            model_info = f"ollama/{self.config.ollama_model}" if self.config.use_ollama else self.config.model
             await ws.send_json({
                 "type": "welcome",
                 "client_id": client_id,
                 "config": {
                     "tts": self.config.elevenlabs_api_key is not None,
                     "stt": self.config.elevenlabs_api_key is not None,
-                    "model": self.config.model,
+                    "model": model_info,
                     "writes": self.config.allow_writes,
                 }
             })
@@ -315,7 +359,7 @@ class BridgeServer:
         # 1. Receive audio chunks
         # 2. Run VAD (voice activity detection)
         # 3. Send to STT (ElevenLabs or browser)
-        # 4. Process transcript with Claude
+        # 4. Process transcript with LLM
         # 5. Get response, send to TTS
         # 6. Stream audio back to frontend
 
@@ -331,8 +375,8 @@ class BridgeServer:
             if audio_data:
                 transcript = await self._transcribe_audio(audio_data)
                 if transcript:
-                    # Process with Claude
-                    response = await self._process_with_claude(transcript, session)
+                    # Process with LLM
+                    response = await self._process_with_llm(transcript, session)
                     # Send response back
                     await session.ws.send_json({
                         "type": "voice",
@@ -352,6 +396,40 @@ class BridgeServer:
             logger.debug("[jarvis] Would call ElevenLabs STT")
             return None  # Fallback to browser for now
         return None  # Browser handles STT
+
+    async def _process_with_llm(self, prompt: str, session: ClientSession) -> str:
+        """Process prompt with configured LLM (Ollama or Claude)."""
+        if self.config.use_ollama and self.ollama_client:
+            return await self._process_with_ollama(prompt)
+        else:
+            return await self._process_with_claude(prompt)
+
+    async def _process_with_ollama(self, prompt: str) -> str:
+        """Process prompt with Ollama."""
+        logger.debug(f"[jarvis] Ollama prompt: {prompt[:100]}...")
+
+        try:
+            # Build conversation context from session
+            # For now, simple single-turn
+            messages = [
+                {"role": "system", "content": "You are JARVIS, a helpful AI assistant. Be concise and natural."},
+                {"role": "user", "content": prompt},
+            ]
+
+            result = await self.ollama_client.chat(messages)
+
+            if "error" in result:
+                return f"Error: {result['error']}"
+
+            # Extract response
+            if "message" in result and "content" in result["message"]:
+                return result["message"]["content"]
+
+            return "No response from Ollama"
+
+        except Exception as e:
+            logger.error(f"[jarvis] Ollama error: {e}")
+            return f"Error: {e}"
 
     async def _process_with_claude(self, prompt: str, session: ClientSession) -> str:
         """Process prompt with Claude CLI."""
@@ -432,8 +510,8 @@ class BridgeServer:
         if not text:
             return
 
-        # Process with Claude
-        response = await self._process_with_claude(text, session)
+        # Process with LLM
+        response = await self._process_with_llm(text, session)
 
         await session.ws.send_json({
             "type": "chat_response",

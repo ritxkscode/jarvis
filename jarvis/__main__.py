@@ -1621,6 +1621,10 @@ def bridge(
     model: str = typer.Option("claude-opus-5", "--model", "-m", help="Claude model"),
     effort: str = typer.Option("medium", "--effort", "-e", help="Reasoning effort"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Debug logging"),
+    # Ollama options
+    ollama: bool = typer.Option(False, "--ollama", help="Use Ollama for local LLM inference"),
+    ollama_model: str = typer.Option("llama3.1", "--ollama-model", help="Ollama model to use"),
+    ollama_host: str = typer.Option("http://localhost:11434", "--ollama-host", help="Ollama host URL"),
 ):
     """Start the Jarvis bridge server (WebSocket backend for voice UI)."""
     import os
@@ -1632,11 +1636,16 @@ def bridge(
     os.environ["JARVIS_EFFORT"] = effort
     os.environ["JARVIS_ALLOW_WRITES"] = "1" if writes else "0"
     os.environ["JARVIS_DEBUG"] = "1" if debug else "0"
+    os.environ["JARVIS_USE_OLLAMA"] = "1" if ollama else "0"
+    os.environ["JARVIS_OLLAMA_MODEL"] = ollama_model
+    os.environ["JARVIS_OLLAMA_HOST"] = ollama_host
+
+    llm_info = f"Ollama ({ollama_model} @ {ollama_host})" if ollama else f"Claude ({model} · Effort: {effort})"
 
     console.print(Panel.fit(
         f"[bold]🤖 Jarvis Bridge[/bold]\n"
         f"Host: {host}:{port}\n"
-        f"Model: {model} · Effort: {effort}\n"
+        f"LLM: {llm_info}\n"
         f"Writes: {'Enabled' if writes else 'Disabled (read-only)'}\n"
         f"Debug: {'On' if debug else 'Off'}",
         title="Starting Bridge",
